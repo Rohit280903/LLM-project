@@ -6,7 +6,7 @@ from ingestion.preprocessing import clean_text
 from ingestion.chunking import chunk_text
 from embeddings.embedder import TextEmbedder
 from vectorstore.faiss_store import FAISSVectorStore
-from rag.generator import DeepSeekGenerator
+from rag.generator import GroqGenerator
 
 
 # ------------------------------
@@ -84,7 +84,7 @@ if st.button("Get Answer"):
                 query_embedding, top_k=5
             )
 
-            generator = DeepSeekGenerator()
+            generator = GroqGenerator()
             answer = generator.generate_answer(question, relevant_chunks)
 
         st.subheader("📌 Answer")
