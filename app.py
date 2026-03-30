@@ -16,16 +16,6 @@ from rag.generator import GroqGenerator
 
 import mlflow
 
-mlflow.set_experiment("rag-project")
-
-with mlflow.start_run():
-    mlflow.log_param("chunk_size", 500)
-    mlflow.log_param("chunk_overlap", 100)
-    mlflow.log_param("embedding_model", "all-MiniLM-L6-v2")
-    mlflow.log_param("groq_model", "llama-3.1-8b-instant")
-    mlflow.log_param("top_k", 5)
-    mlflow.log_metric("num_chunks", len(all_chunks))
-
 # ------------------------------
 # Streamlit Config
 # ------------------------------
@@ -109,6 +99,16 @@ if uploaded_files:
             # ✅ FIX: always create a fresh vector store on new upload
             vector_store = FAISSVectorStore(embedding_dim=embeddings.shape[1])
             vector_store.add_embeddings(embeddings, all_chunks)
+
+            mlflow.set_experiment("rag-project")
+
+            with mlflow.start_run():
+                mlflow.log_param("chunk_size", 500)
+                mlflow.log_param("chunk_overlap", 100)
+                mlflow.log_param("embedding_model", "all-MiniLM-L6-v2")
+                mlflow.log_param("groq_model", "llama-3.1-8b-instant")
+                mlflow.log_param("top_k", 5)
+                mlflow.log_metric("num_chunks", len(all_chunks))
 
             st.session_state.vector_store = vector_store
             st.session_state.chunks = all_chunks
