@@ -1,14 +1,30 @@
 import os
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load .env for local development
+load_dotenv()
 
 from ingestion.loader import load_document
-from ingestion.preprocessing import clean_text
+from ingestion.preprocessing import clean_text_for_embedding  # ← fixed import
 from ingestion.chunking import chunk_text
 
 from embeddings.embedder import TextEmbedder
 from vectorstore.faiss_store import FAISSVectorStore
+from rag.retriever import Retriever                           # ← now used
 from rag.generator import GroqGenerator
 
+import mlflow
+
+mlflow.set_experiment("rag-project")
+
+with mlflow.start_run():
+    mlflow.log_param("chunk_size", 500)
+    mlflow.log_param("chunk_overlap", 100)
+    mlflow.log_param("embedding_model", "all-MiniLM-L6-v2")
+    mlflow.log_param("groq_model", "llama-3.1-8b-instant")
+    mlflow.log_param("top_k", 5)
+    mlflow.log_metric("num_chunks", len(all_chunks))
 
 # ------------------------------
 # Streamlit Config
@@ -20,25 +36,37 @@ st.write("Upload documents and ask grounded questions with citations.")
 # ------------------------------
 # Session State
 # ------------------------------
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
+defaults = {
+    "vector_store": None,
+    "chunks": [],
+    "embedder": None,
+    "generator": None,
+    "retriever": None,
+    "chat_history": [],
+    "suggested_questions": [],
+    "processed_files": [],
+    "selected_question": "",
+}
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
+# Initialise heavy objects once
+if st.session_state.embedder is None:
+    with st.spinner("Loading embedding model..."):
+        st.session_state.embedder = TextEmbedder()
 
-if "embedder" not in st.session_state:
-    st.session_state.embedder = TextEmbedder()
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-if "suggested_questions" not in st.session_state:
-    st.session_state.suggested_questions = []
+if st.session_state.generator is None:
+    try:
+        st.session_state.generator = GroqGenerator()
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
 
 # ------------------------------
 # Sidebar: File Upload
 # ------------------------------
-st.sidebar.header("📂 Upload Document")
+st.sidebar.header("📂 Upload Documents")
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDF or TXT files",
@@ -59,31 +87,56 @@ if uploaded_files:
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
-            raw_text = load_document(file_path)
-            cleaned_text = clean_text(raw_text)
+            try:
+                raw_text = load_document(file_path)
+            except Exception as e:
+                st.sidebar.error(f"Failed to load {uploaded_file.name}: {e}")
+                continue
+
+            # ✅ FIX: use embedding-safe cleaning (preserves punctuation & case)
+            cleaned_text = clean_text_for_embedding(raw_text)
             chunks = chunk_text(cleaned_text)
 
-            # add document metadata
             labeled_chunks = [
                 f"[Doc: {uploaded_file.name} | Chunk {i+1}] {chunk}"
                 for i, chunk in enumerate(chunks)
             ]
-
             all_chunks.extend(labeled_chunks)
 
-        embeddings = st.session_state.embedder.embed_texts(all_chunks)
+        if all_chunks:
+            embeddings = st.session_state.embedder.embed_texts(all_chunks)
 
-        vector_store = FAISSVectorStore(embedding_dim=embeddings.shape[1])
-        vector_store.add_embeddings(embeddings, all_chunks)
+            # ✅ FIX: always create a fresh vector store on new upload
+            vector_store = FAISSVectorStore(embedding_dim=embeddings.shape[1])
+            vector_store.add_embeddings(embeddings, all_chunks)
 
-        st.session_state.vector_store = vector_store
-        st.session_state.chunks = all_chunks
+            st.session_state.vector_store = vector_store
+            st.session_state.chunks = all_chunks
+            st.session_state.processed_files = [f.name for f in uploaded_files]
 
-        # Generate suggested questions
-        generator = GroqGenerator()
-        st.session_state.suggested_questions = generator.generate_questions(all_chunks)
+            # ✅ FIX: reuse session generator instead of creating a new one
+            try:
+                st.session_state.suggested_questions = (
+                    st.session_state.generator.generate_questions(all_chunks)
+                )
+            except Exception as e:
+                st.sidebar.warning(f"Could not generate suggestions: {e}")
 
-    st.sidebar.success(f"Processed {len(all_chunks)} chunks")
+            # Build Retriever
+            st.session_state.retriever = Retriever(
+                embedder=st.session_state.embedder,
+                vector_store=vector_store
+            )
+
+    st.sidebar.success(f"✅ Processed {len(all_chunks)} chunks")
+
+# ------------------------------
+# Sidebar: Processed File List
+# ------------------------------
+if st.session_state.processed_files:
+    st.sidebar.subheader("📄 Loaded Documents")
+    for fname in st.session_state.processed_files:
+        st.sidebar.markdown(f"- `{fname}`")
 
 # ------------------------------
 # Sidebar: Suggested Questions
@@ -91,8 +144,9 @@ if uploaded_files:
 if st.session_state.suggested_questions:
     st.sidebar.subheader("💡 Suggested Questions")
     for q in st.session_state.suggested_questions:
-        if st.sidebar.button(q):
+        if st.sidebar.button(q, key=f"sq_{q[:30]}"):
             st.session_state.selected_question = q
+            st.rerun()
 
 # ------------------------------
 # Main Area
@@ -101,44 +155,64 @@ st.header("💬 Ask a Question")
 
 question = st.text_input(
     "Enter your question:",
-    value=st.session_state.get("selected_question", "")
+    value=st.session_state.selected_question
 )
 
 col1, col2 = st.columns(2)
 
 # ------------------------------
-# Ask Question
+# Ask Question (with streaming)
 # ------------------------------
 if col1.button("Get Answer"):
+    st.session_state.selected_question = ""
+
     if not st.session_state.vector_store:
         st.warning("Please upload a document first.")
     elif not question.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Generating grounded answer..."):
-            generator = GroqGenerator()
+        try:
+            # Rewrite query
+            rewritten_query = st.session_state.generator.rewrite_query(question)
 
-            # Agentic step: rewrite query
-            rewritten_query = generator.rewrite_query(question)
-
-            query_embedding = st.session_state.embedder.embed_query(rewritten_query)
-
-            relevant_chunks = st.session_state.vector_store.similarity_search(
-                query_embedding, top_k=5
+            # Retrieve relevant chunks via Retriever class
+            relevant_chunks = st.session_state.retriever.retrieve(
+                rewritten_query, top_k=5
             )
 
-            answer = generator.generate_answer(
-                rewritten_query, relevant_chunks
+            st.subheader("📌 Answer")
+
+            # ✅ FEATURE: streaming response
+            full_answer = st.write_stream(
+                st.session_state.generator.generate_answer_stream(
+                    rewritten_query,
+                    relevant_chunks,
+                    chat_history=st.session_state.chat_history  # ✅ memory
+                )
             )
 
-            st.session_state.chat_history.append((question, answer))
+            # Save to history
+            st.session_state.chat_history.append((question, full_answer))
 
-        st.subheader("📌 Answer")
-        st.write(answer)
+            # ✅ UX: clean citations panel
+            with st.expander("📄 Source Chunks Used"):
+                for chunk in relevant_chunks:
+                    # Parse "[Doc: file.pdf | Chunk 3] text..."
+                    if chunk.startswith("[Doc:"):
+                        header_end = chunk.find("]")
+                        header = chunk[1:header_end]   # "Doc: file.pdf | Chunk 3"
+                        body = chunk[header_end+1:].strip()
+                        parts = header.split("|")
+                        doc_name = parts[0].replace("Doc:", "").strip()
+                        chunk_num = parts[1].strip() if len(parts) > 1 else ""
+                        st.markdown(f"**{doc_name}** — {chunk_num}")
+                        st.caption(body[:300] + ("..." if len(body) > 300 else ""))
+                        st.divider()
+                    else:
+                        st.markdown(chunk[:300])
 
-        with st.expander("📄 Retrieved Context"):
-            for i, chunk in enumerate(relevant_chunks, 1):
-                st.markdown(f"**Chunk {i}:** {chunk}")
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
 
 # ------------------------------
 # Summarize Document
@@ -147,12 +221,15 @@ if col2.button("Summarize Document"):
     if not st.session_state.chunks:
         st.warning("Upload a document first.")
     else:
-        with st.spinner("Generating summary..."):
-            generator = GroqGenerator()
-            summary = generator.summarize_document(st.session_state.chunks)
-
-        st.subheader("📝 Document Summary")
-        st.write(summary)
+        try:
+            with st.spinner("Generating summary..."):
+                summary = st.session_state.generator.summarize_document(
+                    st.session_state.chunks
+                )
+            st.subheader("📝 Document Summary")
+            st.write(summary)
+        except Exception as e:
+            st.error(f"Summarization failed: {e}")
 
 # ------------------------------
 # Chat History
@@ -162,5 +239,7 @@ if st.session_state.chat_history:
     st.subheader("🧠 Conversation History")
 
     for i, (q, a) in enumerate(st.session_state.chat_history, 1):
-        st.markdown(f"**Q{i}:** {q}")
-        st.markdown(f"**A{i}:** {a}")
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            st.markdown(a)

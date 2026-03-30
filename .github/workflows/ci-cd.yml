@@ -1,0 +1,60 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest tests/test_unit.py -v
+
+  build-and-deploy:
+    needs: test          # only runs if tests pass
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Docker image
+        run: docker build -t rag-app:${{ github.sha }} .
+
+      - name: Deploy to AWS ECS   # swap with your cloud
+        run: echo "Add your AWS deployment steps here"
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+```
+
+**Step 2:** Add your `GROQ_API_KEY` to GitHub Secrets:
+Go to your repo → Settings → Secrets and variables → Actions → New secret.
+
+---
+
+## Your updated folder structure
+```
+project/
+├── .github/
+│   └── workflows/
+│       └── ci-cd.yml          ← GitHub Actions
+├── tests/
+│   ├── test_unit.py           ← pytest unit tests
+│   └── test_rag_eval.py       ← RAGAS quality tests
+├── Dockerfile                 ← containerize the app
+├── docker-compose.yml         ← local dev with Docker
+├── mlflow_runs/               ← auto-created by MLflow
+├── app.py
+└── ... (your existing files)
