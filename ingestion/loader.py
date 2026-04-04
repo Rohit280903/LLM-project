@@ -1,53 +1,64 @@
 import os
 try:
-    # prefer the maintained package name 'pypdf'
     from pypdf import PdfReader
 except ImportError:
-    try:
-        from PyPDF2 import PdfReader
-    except ImportError:
-        raise ImportError("Missing PDF parser: install 'pypdf' (recommended) or 'PyPDF2'. Run: pip install pypdf")
+    from PyPDF2 import PdfReader
+
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 
 def load_txt(file_path: str) -> str:
-    """Load text from a .txt file"""
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 
 def load_pdf(file_path: str) -> str:
-    """Load text from a .pdf file"""
+    """
+    Try normal text extraction first.
+    If the page has no text (scanned), fall back to OCR.
+    """
     reader = PdfReader(file_path)
     text = ""
+    scanned_pages = []
 
-    for page in reader.pages:
+    # Step 1: Try normal extraction
+    for i, page in enumerate(reader.pages):
         page_text = page.extract_text()
-        if page_text:
+        if page_text and page_text.strip():
             text += page_text + "\n"
+        else:
+            scanned_pages.append(i)  # mark as needing OCR
+
+    # Step 2: OCR the scanned pages
+    if scanned_pages:
+        if not OCR_AVAILABLE:
+            raise RuntimeError(
+                "This PDF contains scanned pages but OCR packages are not installed. "
+                "Run: pip install pytesseract pdf2image Pillow"
+            )
+
+        images = convert_from_path(file_path, dpi=300)
+
+        for i in scanned_pages:
+            if i < len(images):
+                ocr_text = pytesseract.image_to_string(images[i])
+                text += ocr_text + "\n"
 
     return text
 
 
 def load_document(file_path: str) -> str:
-    """
-    Detect file type and extract text
-    Supports: PDF, TXT
-    """
     if not os.path.exists(file_path):
         raise FileNotFoundError("File not found")
 
     if file_path.endswith(".pdf"):
         return load_pdf(file_path)
-
     elif file_path.endswith(".txt"):
         return load_txt(file_path)
-
     else:
         raise ValueError("Unsupported file format. Use PDF or TXT.")
-
-
-# Example usage (for testing)
-if __name__ == "__main__":
-    path = "C:\\Users\\Admin\\Desktop\\LLM project\\data\\uploads\\Practical Machine Learning.pdf"
-    text = load_document(path)
-    print(text[:1000])  # print first 1000 characters
