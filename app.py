@@ -14,7 +14,7 @@ from vectorstore.faiss_store import FAISSVectorStore
 from rag.retriever import Retriever                           # ← now used
 from rag.generator import GroqGenerator
 
-import mlflow
+# import mlflow
 
 # ------------------------------
 # Streamlit Config
