@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from dotenv import load_dotenv
-
+import hashlib
 # Load .env for local development
 load_dotenv()
 
@@ -13,9 +13,23 @@ from embeddings.embedder import TextEmbedder
 from vectorstore.faiss_store import FAISSVectorStore
 from rag.retriever import Retriever                           # ← now used
 from rag.generator import GroqGenerator
-from tests.test_unit import test_clean_text_preserves_case, test_chunking_overlap
-from tests.test_rag_eval import test_rag_quality
 import mlflow
+
+# Add this function OUTSIDE the button handler, near the top of app.py
+# Cache answers based on question + document fingerprint to speed up repeated queries
+@st.cache_data(show_spinner=False)
+def get_cached_answer(question: str, rewritten_query: str, chunks_key: str):
+    """
+    Cache answers by question + document fingerprint.
+    chunks_key is a hash of the current chunks so cache invalidates on new upload.
+    """
+    relevant_chunks = st.session_state.retriever.retrieve(rewritten_query, top_k=5)
+    answer = st.session_state.generator.generate_answer(
+        rewritten_query,
+        relevant_chunks,
+        chat_history=[]  # Don't cache with history — history changes every turn
+    )
+    return answer, relevant_chunks
 
 # ------------------------------
 # Streamlit Config
@@ -100,17 +114,29 @@ if uploaded_files:
             # ✅ FIX: always create a fresh vector store on new upload
             vector_store = FAISSVectorStore(embedding_dim=embeddings.shape[1])
             vector_store.add_embeddings(embeddings, all_chunks)
+            # After building the vector store, add:
+            st.session_state.chunks_key = hashlib.md5(
+                "".join(all_chunks[:5]).encode()
+            ).hexdigest()
 
             mlflow.set_experiment("rag-project")
 
-            with mlflow.start_run():
+            with mlflow.start_run(run_name=f"upload_{uploaded_files[0].name}"):
                 mlflow.log_param("chunk_size", 500)
                 mlflow.log_param("chunk_overlap", 100)
                 mlflow.log_param("embedding_model", "all-MiniLM-L6-v2")
                 mlflow.log_param("groq_model", "llama-3.1-8b-instant")
                 mlflow.log_param("top_k", 5)
-                mlflow.log_metric("num_chunks", len(all_chunks))
+                mlflow.log_param("num_files", len(uploaded_files))
 
+                mlflow.log_metric("num_chunks", len(all_chunks))
+                mlflow.log_metric(
+                    "avg_chunk_length",
+                    sum(len(c) for c in all_chunks) / len(all_chunks)
+                )
+
+                # Log file names
+                mlflow.set_tag("files", ", ".join(f.name for f in uploaded_files))
             st.session_state.vector_store = vector_store
             st.session_state.chunks = all_chunks
             st.session_state.processed_files = [f.name for f in uploaded_files]
@@ -144,10 +170,10 @@ if st.session_state.processed_files:
 # ------------------------------
 if st.session_state.suggested_questions:
     st.sidebar.subheader("💡 Suggested Questions")
-    for q in st.session_state.suggested_questions:
-        if st.sidebar.button(q, key=f"sq_{q[:30]}"):
-            st.session_state.selected_question = q
-            st.rerun()
+    for i, q in enumerate(st.session_state.suggested_questions):
+        if st.sidebar.button(q, key=f"sq_{i}"):
+            st.session_state.input_query = q
+
 
 # ------------------------------
 # Main Area
@@ -173,24 +199,59 @@ if col1.button("Get Answer"):
         st.warning("Please enter a question.")
     else:
         try:
-            # Rewrite query
             rewritten_query = st.session_state.generator.rewrite_query(question)
 
-            # Retrieve relevant chunks via Retriever class
-            relevant_chunks = st.session_state.retriever.retrieve(
-                rewritten_query, top_k=5
-            )
+            import hashlib
+            cache_key = hashlib.md5(
+                (question + rewritten_query + st.session_state.get("chunks_key", "default")).encode()
+            ).hexdigest()
 
-            st.subheader("📌 Answer")
+            # ------------------------------
+            # ✅ CACHE CHECK
+            # ------------------------------
+            if "qa_cache" not in st.session_state:
+                st.session_state.qa_cache = {}
 
-            # ✅ FEATURE: streaming response
-            full_answer = st.write_stream(
-                st.session_state.generator.generate_answer_stream(
-                    rewritten_query,
-                    relevant_chunks,
-                    chat_history=st.session_state.chat_history  # ✅ memory
+            if cache_key in st.session_state.qa_cache:
+                # ✅ Cached response (instant)
+                full_answer, relevant_chunks = st.session_state.qa_cache[cache_key]
+
+                st.subheader("📌 Answer (Cached ⚡)")
+                st.write(full_answer)
+
+                cached_flag = 1
+
+            else:
+                # ------------------------------
+                # ❌ NOT CACHED → RUN FULL PIPELINE
+                # ------------------------------
+                relevant_chunks = st.session_state.retriever.retrieve(
+                    rewritten_query, top_k=5
                 )
-            )
+
+                st.subheader("📌 Answer")
+
+                full_answer = st.write_stream(
+                    st.session_state.generator.generate_answer_stream(
+                        rewritten_query,
+                        relevant_chunks,
+                        chat_history=st.session_state.chat_history
+                    )
+                )
+
+                # Save in cache
+                st.session_state.qa_cache[cache_key] = (full_answer, relevant_chunks)
+
+                cached_flag = 0
+
+            # ✅ MLflow logging for Q&A
+            mlflow.end_run()  # prevent active run issue in Streamlit
+
+            with mlflow.start_run(run_name="qa_query"):
+                mlflow.log_param("query", question[:100])
+                mlflow.log_param("rewritten_query", rewritten_query[:100])
+                mlflow.log_metric("num_chunks_retrieved", len(relevant_chunks))
+                mlflow.log_metric("answer_length", len(full_answer))
 
             # Save to history
             st.session_state.chat_history.append((question, full_answer))
