@@ -13,8 +13,9 @@ from embeddings.embedder import TextEmbedder
 from vectorstore.faiss_store import FAISSVectorStore
 from rag.retriever import Retriever                           # ← now used
 from rag.generator import GroqGenerator
-
-# import mlflow
+from tests.test_unit import test_clean_text_preserves_case, test_chunking_overlap
+from tests.test_rag_eval import test_rag_quality
+import mlflow
 
 # ------------------------------
 # Streamlit Config
